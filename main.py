@@ -37,16 +37,6 @@ class MarketData:
     volume_ratio: float
 
 
-def env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-
-
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if not value:
@@ -64,7 +54,6 @@ def get_json(url: str, params: dict[str, str | int], timeout: float) -> Any:
 
 
 def calculate_ema(values: list[float], period: int) -> float:
-    """Calculate the latest exponential moving average."""
     if len(values) < period:
         raise ValueError(f"At least {period} values are required for EMA")
 
@@ -78,7 +67,6 @@ def calculate_ema(values: list[float], period: int) -> float:
 
 
 def calculate_rsi(values: list[float], period: int = 14) -> float:
-    """Calculate the latest Wilder RSI value."""
     if len(values) < period + 1:
         raise ValueError(f"At least {period + 1} values are required for RSI")
 
@@ -123,7 +111,15 @@ def _parse_klines(payload: Any) -> tuple[list[float], list[float]]:
 def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
     """Fetch live Binance data and calculate indicators."""
     try:
-        funding_payload = get_json(FUNDING_URL, params={"symbol": symbol}, timeout=timeout)
+        # Funding rate is optional (Binance often blocks it on free hosting)
+        funding_percent = 0.0
+        try:
+            funding_payload = get_json(FUNDING_URL, params={"symbol": symbol}, timeout=timeout)
+            if isinstance(funding_payload, dict):
+                funding_percent = float(funding_payload.get("lastFundingRate", 0)) * 100
+        except Exception as e:
+            LOGGER.warning("Could not fetch funding rate (using 0.0): %s", e)
+
         ticker_payload = get_json(TICKER_URL, params={"symbol": symbol}, timeout=timeout)
         klines_payload = get_json(
             KLINES_URL,
@@ -131,8 +127,6 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
             timeout=timeout,
         )
 
-        if not isinstance(funding_payload, dict):
-            raise MarketDataError("Binance returned invalid funding data")
         if not isinstance(ticker_payload, dict):
             raise MarketDataError("Binance returned invalid ticker data")
 
@@ -151,7 +145,7 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
             interval=interval,
             price=float(ticker_payload["lastPrice"]),
             change_24h=float(ticker_payload["priceChangePercent"]),
-            funding_percent=float(funding_payload.get("lastFundingRate", 0)) * 100,
+            funding_percent=funding_percent,
             ema20=calculate_ema(closes, 20),
             ema50=calculate_ema(closes, 50),
             rsi14=calculate_rsi(closes, 14),
@@ -165,7 +159,6 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
 
 
 def score_market(data: MarketData) -> tuple[int, str]:
-    """Return checklist score and signal label."""
     score = 0
     trend_good = data.ema20 > data.ema50
 
@@ -186,7 +179,6 @@ def score_market(data: MarketData) -> tuple[int, str]:
 
 
 def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, int, str]:
-    """Build Telegram message, score, and signal label."""
     timestamp = now or datetime.now().astimezone()
     score, signal = score_market(data)
 
@@ -234,22 +226,12 @@ def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, i
 
 
 def append_signal_history(data: MarketData, score: int, signal: str) -> None:
-    """Save every real alert for later evaluation."""
     history_path = Path(os.getenv("SIGNAL_HISTORY_FILE", "signal_history.csv"))
 
     fieldnames = [
-        "timestamp",
-        "symbol",
-        "interval",
-        "price",
-        "change_24h",
-        "funding_percent",
-        "ema20",
-        "ema50",
-        "rsi14",
-        "volume_ratio",
-        "score",
-        "signal",
+        "timestamp", "symbol", "interval", "price", "change_24h",
+        "funding_percent", "ema20", "ema50", "rsi14", "volume_ratio",
+        "score", "signal",
     ]
 
     file_exists = history_path.exists()
@@ -260,22 +242,20 @@ def append_signal_history(data: MarketData, score: int, signal: str) -> None:
             if not file_exists:
                 writer.writeheader()
 
-            writer.writerow(
-                {
-                    "timestamp": datetime.now().astimezone().isoformat(),
-                    "symbol": data.symbol,
-                    "interval": data.interval,
-                    "price": f"{data.price:.8f}",
-                    "change_24h": f"{data.change_24h:.4f}",
-                    "funding_percent": f"{data.funding_percent:.6f}",
-                    "ema20": f"{data.ema20:.8f}",
-                    "ema50": f"{data.ema50:.8f}",
-                    "rsi14": f"{data.rsi14:.4f}",
-                    "volume_ratio": f"{data.volume_ratio:.4f}",
-                    "score": score,
-                    "signal": signal,
-                }
-            )
+            writer.writerow({
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "symbol": data.symbol,
+                "interval": data.interval,
+                "price": f"{data.price:.8f}",
+                "change_24h": f"{data.change_24h:.4f}",
+                "funding_percent": f"{data.funding_percent:.6f}",
+                "ema20": f"{data.ema20:.8f}",
+                "ema50": f"{data.ema50:.8f}",
+                "rsi14": f"{data.rsi14:.4f}",
+                "volume_ratio": f"{data.volume_ratio:.4f}",
+                "score": score,
+                "signal": signal,
+            })
     except OSError as exc:
         LOGGER.warning("Could not save signal history: %s", exc)
 
@@ -285,9 +265,7 @@ def send_telegram(message: str, timeout: float = 10) -> None:
     chat_id = os.getenv("CHAT_ID")
 
     if not token or not chat_id:
-        raise ValueError(
-            "BOT_TOKEN and CHAT_ID are required. Use --dry-run to preview instead."
-        )
+        raise ValueError("BOT_TOKEN and CHAT_ID are required.")
 
     response = requests.post(
         TELEGRAM_URL.format(token=token),
@@ -306,9 +284,7 @@ def send_telegram(message: str, timeout: float = 10) -> None:
 
     if not response.ok or not result.get("ok"):
         description = result.get("description", "Telegram rejected the message")
-        raise RuntimeError(
-            f"Telegram request failed (HTTP {response.status_code}): {description}"
-        )
+        raise RuntimeError(f"Telegram request failed (HTTP {response.status_code}): {description}")
 
     LOGGER.info("Alert sent to Telegram")
 
