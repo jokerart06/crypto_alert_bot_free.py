@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import logging
 import os
 import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -25,8 +22,6 @@ TELEGRAM_GET_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
 START_TIME = datetime.now().astimezone()
 LAST_ALERT_TIME: datetime | None = None
 NEXT_ALERT_TIME: datetime | None = None
-
-# Watchlist (loaded from env, can be changed via Telegram)
 WATCHLIST: list[str] = []
 
 
@@ -93,11 +88,11 @@ def calculate_rsi(values: list[float], period: int = 14) -> float:
 
 def _parse_klines(payload: Any) -> tuple[list[float], list[float]]:
     if not isinstance(payload, list):
-        raise MarketDataError("Binance returned invalid candle data")
+        raise MarketDataError("Invalid candle data")
     closes, volumes = [], []
     for candle in payload:
         if not isinstance(candle, list) or len(candle) < 6:
-            raise MarketDataError("Binance returned an incomplete candle")
+            raise MarketDataError("Incomplete candle")
         closes.append(float(candle[4]))
         volumes.append(float(candle[5]))
     return closes, volumes
@@ -111,7 +106,7 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
             if isinstance(funding_payload, dict):
                 funding_percent = float(funding_payload.get("lastFundingRate", 0)) * 100
         except Exception as e:
-            LOGGER.warning("Could not fetch funding rate (using 0.0): %s", e)
+            LOGGER.warning("Funding rate unavailable: %s", e)
 
         ticker_payload = get_json(TICKER_URL, params={"symbol": symbol}, timeout=timeout)
         klines_payload = get_json(
@@ -121,14 +116,14 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
         )
 
         if not isinstance(ticker_payload, dict):
-            raise MarketDataError("Binance returned invalid ticker data")
+            raise MarketDataError("Invalid ticker data")
 
         closes, volumes = _parse_klines(klines_payload)
         if len(volumes) < 21:
-            raise MarketDataError("Not enough candles for volume analysis")
+            raise MarketDataError("Not enough candles")
 
-        average_previous_volume = sum(volumes[-21:-1]) / 20
-        volume_ratio = volumes[-1] / average_previous_volume if average_previous_volume > 0 else 0.0
+        avg_vol = sum(volumes[-21:-1]) / 20
+        volume_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
 
         return MarketData(
             symbol=symbol,
@@ -143,41 +138,29 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
         )
     except MarketDataError:
         raise
-    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+    except Exception as exc:
         raise MarketDataError(f"Could not fetch market data: {exc}") from exc
 
 
 def get_hot_coins(timeout: float = 15) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
-    """Return top 10 gainers and top 10 by volume (USDT pairs only)."""
     try:
         data = get_json(TICKER_URL, timeout=timeout)
-        usdt_pairs = [
+        usdt = [
             t for t in data
             if isinstance(t, dict)
-            and t.get("symbol", "").endswith("USDT")
-            and not t["symbol"].endswith("UPUSDT")
-            and not t["symbol"].endswith("DOWNUSDT")
+            and str(t.get("symbol", "")).endswith("USDT")
+            and not str(t["symbol"]).endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
         ]
 
-        # Top Gainers
-        gainers = sorted(
-            usdt_pairs,
-            key=lambda x: float(x.get("priceChangePercent", 0)),
-            reverse=True
-        )[:10]
+        gainers = sorted(usdt, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)[:10]
         top_gainers = [(t["symbol"], float(t["priceChangePercent"])) for t in gainers]
 
-        # Top Volume
-        by_volume = sorted(
-            usdt_pairs,
-            key=lambda x: float(x.get("quoteVolume", 0)),
-            reverse=True
-        )[:10]
-        top_volume = [(t["symbol"], float(t["quoteVolume"])) for t in by_volume]
+        by_vol = sorted(usdt, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)[:10]
+        top_volume = [(t["symbol"], float(t["quoteVolume"])) for t in by_vol]
 
         return top_gainers, top_volume
     except Exception as e:
-        LOGGER.warning("Could not fetch hot coins: %s", e)
+        LOGGER.warning("Hot coins unavailable: %s", e)
         return [], []
 
 
@@ -203,11 +186,100 @@ def score_market(data: MarketData) -> tuple[int, str]:
 def get_uptime_str() -> str:
     uptime = datetime.now().astimezone() - START_TIME
     days = uptime.days
-    hours, remainder = divmod(uptime.seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
+    hours, rem = divmod(uptime.seconds, 3600)
+    minutes = rem // 60
     if days > 0:
         return f"{days}d {hours}h {minutes}m"
     return f"{hours}h {minutes}m"
+
+
+def analyze_trend(data: MarketData) -> list[str]:
+    """Create a careful, educational trend analysis."""
+    lines = ["<b>📊 TREND ANALYZER</b>"]
+
+    # 1. Trend structure
+    ema_diff_pct = ((data.ema20 - data.ema50) / data.ema50) * 100 if data.ema50 else 0
+
+    if data.ema20 > data.ema50:
+        if ema_diff_pct > 1.5:
+            trend_text = "Strong bullish structure (EMA20 well above EMA50)"
+        elif ema_diff_pct > 0.4:
+            trend_text = "Bullish structure (EMA20 above EMA50)"
+        else:
+            trend_text = "Mild bullish bias (EMAs close)"
+    else:
+        if ema_diff_pct < -1.5:
+            trend_text = "Strong bearish structure (EMA20 well below EMA50)"
+        elif ema_diff_pct < -0.4:
+            trend_text = "Bearish structure (EMA20 below EMA50)"
+        else:
+            trend_text = "Mild bearish bias (EMAs close)"
+
+    lines.append(f"• Structure: {trend_text}")
+
+    # 2. Momentum (24h)
+    if data.change_24h > 5:
+        mom = "Strong positive momentum"
+    elif data.change_24h > 1.5:
+        mom = "Positive momentum"
+    elif data.change_24h > -1.5:
+        mom = "Neutral / consolidating"
+    elif data.change_24h > -5:
+        mom = "Negative momentum"
+    else:
+        mom = "Strong negative momentum"
+
+    lines.append(f"• 24h Momentum: {mom} ({data.change_24h:+.2f}%)")
+
+    # 3. RSI
+    if data.rsi14 >= 70:
+        rsi_text = "Overbought zone — caution for long entries"
+    elif data.rsi14 >= 60:
+        rsi_text = "Upper neutral — strength present"
+    elif data.rsi14 >= 45:
+        rsi_text = "Healthy neutral zone"
+    elif data.rsi14 >= 30:
+        rsi_text = "Lower neutral — weakness present"
+    else:
+        rsi_text = "Oversold zone — possible bounce area"
+
+    lines.append(f"• RSI: {rsi_text} ({data.rsi14:.1f})")
+
+    # 4. Volume
+    if data.volume_ratio >= 1.5:
+        vol_text = "Strong volume confirmation"
+    elif data.volume_ratio >= 1.0:
+        vol_text = "Volume supporting the move"
+    elif data.volume_ratio >= 0.7:
+        vol_text = "Average volume"
+    else:
+        vol_text = "Low volume — move lacks conviction"
+
+    lines.append(f"• Volume: {vol_text}")
+
+    # 5. Overall bias (careful language)
+    bull_points = 0
+    if data.ema20 > data.ema50:
+        bull_points += 1
+    if data.change_24h > 1:
+        bull_points += 1
+    if 45 <= data.rsi14 <= 65:
+        bull_points += 1
+    if data.volume_ratio >= 1.0:
+        bull_points += 1
+
+    if bull_points >= 3:
+        bias = "Short-term bias appears cautiously bullish"
+    elif bull_points <= 1:
+        bias = "Short-term bias appears cautiously bearish / weak"
+    else:
+        bias = "Short-term bias is mixed / neutral"
+
+    lines.append(f"• Overall: {bias}")
+    lines.append("")
+    lines.append("<i>Based on recent technical data only. Not financial advice.</i>")
+
+    return lines
 
 
 def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, int, str]:
@@ -216,27 +288,26 @@ def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, i
     uptime_str = get_uptime_str()
 
     change_sign = "+" if data.change_24h >= 0 else ""
-    trend_status = "BULLISH " if data.ema20 > data.ema50 else "BEARISH "
+    trend_status = "BULLISH" if data.ema20 > data.ema50 else "BEARISH"
 
     if 45 <= data.rsi14 <= 65:
-        rsi_status = "GOOD "
+        rsi_status = "GOOD"
     elif data.rsi14 > 70:
-        rsi_status = "OVERBOUGHT "
+        rsi_status = "OVERBOUGHT"
     elif data.rsi14 < 30:
-        rsi_status = "OVERSOLD "
+        rsi_status = "OVERSOLD"
     else:
-        rsi_status = "NEUTRAL "
+        rsi_status = "NEUTRAL"
 
     if data.funding_percent < 0:
-        funding_status = "GOOD "
+        funding_status = "GOOD"
     elif data.funding_percent > 0.10:
-        funding_status = "BAD "
+        funding_status = "BAD"
     else:
-        funding_status = "NEUTRAL "
+        funding_status = "NEUTRAL"
 
-    volume_status = "GOOD " if data.volume_ratio >= 1.0 else "NEUTRAL "
+    volume_status = "GOOD" if data.volume_ratio >= 1.0 else "NEUTRAL"
 
-    # Hot coins
     top_gainers, top_volume = get_hot_coins()
 
     lines = [
@@ -244,59 +315,53 @@ def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, i
         "",
         f"<b>{data.symbol}</b>: ${data.price:,.2f} ({change_sign}{data.change_24h:.2f}% 24h)",
         "",
-        f"Trend: {trend_status}(EMA20 ${data.ema20:,.2f} / EMA50 ${data.ema50:,.2f})",
+        f"Trend: {trend_status} (EMA20 ${data.ema20:,.2f} / EMA50 ${data.ema50:,.2f})",
         f"RSI 14: {data.rsi14:.1f} {rsi_status}",
         f"Funding: {data.funding_percent:.4f}% {funding_status}",
-        f"Volume: {data.volume_ratio:.2f}x average {volume_status}",
+        f"Volume: {data.volume_ratio:.2f}x {volume_status}",
         "",
-        f"<b>Score: {score}/4</b>",
-        f"<b>Checklist strength: {score * 25}%</b>",
-        "",
+        f"<b>Score: {score}/4</b>  |  Strength: {score*25}%",
         f"<b>Signal: {signal}</b>",
         "",
-        f"<i>Bot Uptime: {uptime_str}</i>",
-        "",
-        "<b>——— HOT COINS ———</b>",
     ]
 
-    if top_gainers:
-        lines.append("<b>Top 10 Gainers:</b>")
-        for i, (sym, change) in enumerate(top_gainers, 1):
-            lines.append(f"{i}. {sym} {change:+.1f}%")
-    else:
-        lines.append("Top Gainers: unavailable")
-
+    # Add Trend Analyzer
+    lines.extend(analyze_trend(data))
     lines.append("")
 
+    # Hot coins
+    lines.append("<b>——— HOT COINS ———</b>")
+    if top_gainers:
+        lines.append("<b>Top Gainers:</b>")
+        for i, (sym, ch) in enumerate(top_gainers[:8], 1):  # limit to 8 to save space
+            lines.append(f"{i}. {sym} {ch:+.1f}%")
+    lines.append("")
     if top_volume:
-        lines.append("<b>Top 10 Volume:</b>")
-        for i, (sym, vol) in enumerate(top_volume, 1):
-            vol_m = vol / 1_000_000
-            lines.append(f"{i}. {sym} ${vol_m:,.1f}M")
-    else:
-        lines.append("Top Volume: unavailable")
+        lines.append("<b>Top Volume:</b>")
+        for i, (sym, vol) in enumerate(top_volume[:6], 1):
+            lines.append(f"{i}. {sym} ${vol/1_000_000:,.0f}M")
 
     if WATCHLIST:
         lines.append("")
-        lines.append(f"<b>Your Watchlist:</b> {', '.join(WATCHLIST)}")
+        lines.append(f"<b>Watchlist:</b> {', '.join(WATCHLIST)}")
 
     lines += [
         "",
-        "<i>Educational alert only — not financial advice.</i>",
-        f"<i>Updated: {timestamp.strftime('%Y-%m-%d %H:%M')}</i>",
+        f"<i>Bot Uptime: {uptime_str}</i>",
+        "<i>Educational only — not financial advice.</i>",
+        f"<i>{timestamp.strftime('%Y-%m-%d %H:%M')}</i>",
     ]
 
     return "\n".join(lines), score, signal
 
 
-def send_telegram(message: str, timeout: float = 10) -> None:
+def send_telegram(message: str, timeout: float = 12) -> None:
     token = os.getenv("BOT_TOKEN")
     chat_id = os.getenv("CHAT_ID")
     if not token or not chat_id:
-        raise ValueError("BOT_TOKEN and CHAT_ID are required.")
+        raise ValueError("BOT_TOKEN and CHAT_ID required")
 
-    # Telegram has a 4096 character limit
-    if len(message) > 4000:
+    if len(message) > 4090:
         message = message[:4000] + "\n\n...(truncated)"
 
     response = requests.post(
@@ -304,16 +369,10 @@ def send_telegram(message: str, timeout: float = 10) -> None:
         data={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
         timeout=timeout,
     )
-    result = {}
-    try:
-        result = response.json()
-    except ValueError:
-        pass
-
+    result = response.json() if response.content else {}
     if not response.ok or not result.get("ok"):
-        description = result.get("description", "Telegram rejected the message")
-        raise RuntimeError(f"Telegram failed: {description}")
-    LOGGER.info("Alert sent to Telegram")
+        raise RuntimeError(result.get("description", "Telegram error"))
+    LOGGER.info("Message sent")
 
 
 def run_once(*, dry_run: bool = False) -> None:
@@ -323,7 +382,7 @@ def run_once(*, dry_run: bool = False) -> None:
     interval = os.getenv("CANDLE_INTERVAL", "1h")
     timeout = env_float("REQUEST_TIMEOUT_SECONDS", 15)
 
-    data = get_market_data(symbol=symbol, interval=interval, timeout=timeout)
+    data = get_market_data(symbol, interval, timeout)
     message, score, signal = build_message(data)
 
     if dry_run:
@@ -332,90 +391,70 @@ def run_once(*, dry_run: bool = False) -> None:
 
     send_telegram(message)
     LAST_ALERT_TIME = datetime.now().astimezone()
-    interval_hours = env_float("RUN_INTERVAL_HOURS", 6)
-    NEXT_ALERT_TIME = LAST_ALERT_TIME + timedelta(hours=interval_hours)
+    hours = env_float("RUN_INTERVAL_HOURS", 6)
+    NEXT_ALERT_TIME = LAST_ALERT_TIME + timedelta(hours=hours)
 
 
 def handle_command(text: str) -> str | None:
     global WATCHLIST
-    text = text.strip()
-    lower = text.lower()
+    lower = text.strip().lower()
 
     if lower in ("/start", "start"):
         return (
-            "<b>Crypto Alert Bot is online</b>\n\n"
-            "Commands:\n"
-            "/uptime - Bot uptime\n"
-            "/refresh or /now - Send full report now\n"
-            "/status - Bot status\n"
-            "/watchlist - Show your watchlist\n"
-            "/add SYMBOL - Add coin (e.g. /add SOLUSDT)\n"
-            "/remove SYMBOL - Remove coin\n"
-            "/clearwatchlist - Clear watchlist\n"
-            "/help - Show help"
+            "<b>Crypto Alert Bot Online</b>\n\n"
+            "/uptime - Uptime\n"
+            "/refresh or /now - Full report now\n"
+            "/status - Status\n"
+            "/watchlist - Show watchlist\n"
+            "/add SYMBOL - Add to watchlist\n"
+            "/remove SYMBOL - Remove\n"
+            "/clearwatchlist\n"
+            "/help"
         )
 
     if lower in ("/help", "help"):
-        return (
-            "<b>Available Commands</b>\n\n"
-            "/uptime\n/refresh or /now\n/status\n"
-            "/watchlist\n/add SYMBOL\n/remove SYMBOL\n/clearwatchlist"
-        )
+        return "Commands: /uptime /refresh /status /watchlist /add /remove /clearwatchlist"
 
     if lower in ("/uptime", "uptime"):
-        return f"<b>Bot Uptime:</b> {get_uptime_str()}"
+        return f"<b>Uptime:</b> {get_uptime_str()}"
 
     if lower in ("/refresh", "/now", "refresh", "now"):
         try:
-            run_once(dry_run=False)
+            run_once()
             return None
         except Exception as e:
-            return f"Failed to refresh: {e}"
+            return f"Error: {e}"
 
     if lower in ("/status", "status"):
         uptime = get_uptime_str()
-        last = LAST_ALERT_TIME.strftime('%Y-%m-%d %H:%M') if LAST_ALERT_TIME else "Never"
-        next_t = NEXT_ALERT_TIME.strftime('%Y-%m-%d %H:%M') if NEXT_ALERT_TIME else "Unknown"
-        return (
-            f"<b>Bot Status</b>\n\n"
-            f"Uptime: {uptime}\n"
-            f"Last alert: {last}\n"
-            f"Next alert: {next_t}\n"
-            f"Watchlist: {', '.join(WATCHLIST) if WATCHLIST else 'Empty'}"
-        )
+        last = LAST_ALERT_TIME.strftime("%Y-%m-%d %H:%M") if LAST_ALERT_TIME else "Never"
+        nxt = NEXT_ALERT_TIME.strftime("%Y-%m-%d %H:%M") if NEXT_ALERT_TIME else "—"
+        return f"<b>Status</b>\nUptime: {uptime}\nLast: {last}\nNext: {nxt}\nWatchlist: {', '.join(WATCHLIST) or 'Empty'}"
 
     if lower in ("/watchlist", "watchlist"):
-        if not WATCHLIST:
-            return "Your watchlist is empty.\nUse /add SYMBOL to add coins."
-        return f"<b>Your Watchlist:</b>\n" + "\n".join(f"• {s}" for s in WATCHLIST)
+        return f"<b>Watchlist:</b>\n" + ("\n".join(f"• {s}" for s in WATCHLIST) if WATCHLIST else "Empty")
 
-    if lower.startswith("/add ") or lower.startswith("add "):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            return "Usage: /add SOLUSDT"
-        symbol = parts[1].strip().upper()
-        if not symbol.endswith("USDT"):
-            symbol += "USDT"
-        if symbol in WATCHLIST:
-            return f"{symbol} is already in your watchlist."
-        WATCHLIST.append(symbol)
-        return f"Added <b>{symbol}</b> to watchlist."
+    if lower.startswith(("/add ", "add ")):
+        sym = text.split(maxsplit=1)[1].strip().upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        if sym in WATCHLIST:
+            return f"{sym} already in watchlist"
+        WATCHLIST.append(sym)
+        return f"Added <b>{sym}</b>"
 
-    if lower.startswith("/remove ") or lower.startswith("remove "):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            return "Usage: /remove SOLUSDT"
-        symbol = parts[1].strip().upper()
-        if not symbol.endswith("USDT"):
-            symbol += "USDT"
-        if symbol not in WATCHLIST:
-            return f"{symbol} is not in your watchlist."
-        WATCHLIST.remove(symbol)
-        return f"Removed <b>{symbol}</b> from watchlist."
+    if lower.startswith(("/remove ", "remove ")):
+        sym = text.split(maxsplit=1)[1].strip().upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        if sym in WATCHLIST:
+            WATCHLIST.remove(sym)
+            return f"Removed <b>{sym}</b>"
+        return f"{sym} not in watchlist"
 
     if lower in ("/clearwatchlist", "clearwatchlist"):
         WATCHLIST.clear()
-        return "Watchlist cleared."
+        return "Watchlist cleared"
 
     return None
 
@@ -424,37 +463,33 @@ def telegram_listener():
     token = os.getenv("BOT_TOKEN")
     chat_id = os.getenv("CHAT_ID")
     if not token or not chat_id:
-        LOGGER.error("BOT_TOKEN or CHAT_ID missing")
         return
 
     offset = 0
-    LOGGER.info("Telegram command listener started")
+    LOGGER.info("Command listener started")
 
     while True:
         try:
-            response = requests.get(
+            r = requests.get(
                 TELEGRAM_GET_UPDATES.format(token=token),
                 params={"offset": offset, "timeout": 30},
                 timeout=35,
             )
-            data = response.json()
+            data = r.json()
             if not data.get("ok"):
                 time.sleep(5)
                 continue
 
-            for update in data.get("result", []):
-                offset = update["update_id"] + 1
-                message = update.get("message")
-                if not message:
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg or str(msg["chat"]["id"]) != str(chat_id):
                     continue
-                if str(message["chat"]["id"]) != str(chat_id):
-                    continue
-                text = message.get("text", "")
-                if not text:
-                    continue
-                reply = handle_command(text)
-                if reply:
-                    send_telegram(reply)
+                text = msg.get("text", "")
+                if text:
+                    reply = handle_command(text)
+                    if reply:
+                        send_telegram(reply)
         except Exception as e:
             LOGGER.warning("Listener error: %s", e)
             time.sleep(10)
@@ -465,46 +500,38 @@ def load_watchlist():
     raw = os.getenv("SYMBOLS", "")
     if raw:
         WATCHLIST = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        LOGGER.info("Loaded watchlist from env: %s", WATCHLIST)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                        format="%(asctime)s %(levelname)s %(message)s")
 
     load_watchlist()
-
-    interval_hours = env_float("RUN_INTERVAL_HOURS", 6)
-    if interval_hours <= 0:
-        raise ValueError("RUN_INTERVAL_HOURS must be > 0")
+    hours = env_float("RUN_INTERVAL_HOURS", 6)
 
     if args.dry_run or args.once:
         run_once(dry_run=args.dry_run)
         return
 
-    listener = threading.Thread(target=telegram_listener, daemon=True)
-    listener.start()
-
-    LOGGER.info("Bot started | Interval: %.2f hours", interval_hours)
+    threading.Thread(target=telegram_listener, daemon=True).start()
+    LOGGER.info("Bot started | every %.1f hours", hours)
 
     try:
-        run_once(dry_run=False)
+        run_once()
     except Exception as e:
-        LOGGER.error("Initial alert failed: %s", e)
+        LOGGER.error("First alert failed: %s", e)
 
     while True:
-        time.sleep(interval_hours * 3600)
+        time.sleep(hours * 3600)
         try:
-            run_once(dry_run=False)
+            run_once()
         except Exception as e:
-            LOGGER.error("Scheduled alert failed: %s", e)
+            LOGGER.error("Alert failed: %s", e)
 
 
 if __name__ == "__main__":
