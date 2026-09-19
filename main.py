@@ -5,8 +5,9 @@ import csv
 import logging
 import os
 import time
+import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,11 @@ FUNDING_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
 KLINES_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_GET_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
+
+START_TIME = datetime.now().astimezone()
+LAST_ALERT_TIME: datetime | None = None
+NEXT_ALERT_TIME: datetime | None = None
 
 
 class MarketDataError(RuntimeError):
@@ -47,7 +53,7 @@ def env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number") from exc
 
 
-def get_json(url: str, params: dict[str, str | int], timeout: float) -> Any:
+def get_json(url: str, params: dict[str, str | int] | None = None, timeout: float = 15) -> Any:
     response = requests.get(url, params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
@@ -109,9 +115,7 @@ def _parse_klines(payload: Any) -> tuple[list[float], list[float]]:
 
 
 def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
-    """Fetch live Binance data and calculate indicators."""
     try:
-        # Funding rate is optional (Binance often blocks it on free hosting)
         funding_percent = 0.0
         try:
             funding_payload = get_json(FUNDING_URL, params={"symbol": symbol}, timeout=timeout)
@@ -178,9 +182,22 @@ def score_market(data: MarketData) -> tuple[int, str]:
     return score, "WAIT"
 
 
+def get_uptime_str() -> str:
+    uptime = datetime.now().astimezone() - START_TIME
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    return f"{hours}h {minutes}m"
+
+
 def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, int, str]:
     timestamp = now or datetime.now().astimezone()
     score, signal = score_market(data)
+
+    uptime_str = get_uptime_str()
 
     change_sign = "+" if data.change_24h >= 0 else ""
     trend_status = "BULLISH " if data.ema20 > data.ema50 else "BEARISH "
@@ -218,6 +235,7 @@ def build_message(data: MarketData, now: datetime | None = None) -> tuple[str, i
         "",
         f"<b>Signal: {signal}</b>",
         "",
+        f"<i>Bot Uptime: {uptime_str}</i>",
         "<i>Educational alert only — not financial advice. Confirm before trading.</i>",
         f"<i>Updated: {timestamp.strftime('%Y-%m-%d %H:%M')}</i>",
     ]
@@ -289,7 +307,9 @@ def send_telegram(message: str, timeout: float = 10) -> None:
     LOGGER.info("Alert sent to Telegram")
 
 
-def run_once(*, dry_run: bool) -> None:
+def run_once(*, dry_run: bool = False) -> None:
+    global LAST_ALERT_TIME, NEXT_ALERT_TIME
+
     symbol = os.getenv("SYMBOL", "BTCUSDT").upper()
     interval = os.getenv("CANDLE_INTERVAL", "1h")
     timeout = env_float("REQUEST_TIMEOUT_SECONDS", 15)
@@ -303,6 +323,105 @@ def run_once(*, dry_run: bool) -> None:
 
     send_telegram(message, timeout=timeout)
     append_signal_history(data, score, signal)
+
+    LAST_ALERT_TIME = datetime.now().astimezone()
+    interval_hours = env_float("RUN_INTERVAL_HOURS", 6)
+    NEXT_ALERT_TIME = LAST_ALERT_TIME + timedelta(hours=interval_hours)
+
+
+def handle_command(text: str) -> str | None:
+    text = text.strip().lower()
+
+    if text in ("/start", "start"):
+        return (
+            "<b>Crypto Alert Bot is online</b>\n\n"
+            "Available commands:\n"
+            "/uptime - Show bot uptime\n"
+            "/refresh or /now - Send market checklist now\n"
+            "/status - Show bot status\n"
+            "/help - Show this help"
+        )
+
+    if text in ("/help", "help"):
+        return (
+            "<b>Commands:</b>\n\n"
+            "/uptime - Show how long the bot has been running\n"
+            "/refresh or /now - Force send the market checklist immediately\n"
+            "/status - Show current status\n"
+            "/help - Show this message"
+        )
+
+    if text in ("/uptime", "uptime"):
+        return f"<b>Bot Uptime:</b> {get_uptime_str()}"
+
+    if text in ("/refresh", "/now", "refresh", "now"):
+        try:
+            run_once(dry_run=False)
+            return None  # The full alert is already sent
+        except Exception as e:
+            return f"Failed to refresh: {e}"
+
+    if text in ("/status", "status"):
+        uptime = get_uptime_str()
+        last = LAST_ALERT_TIME.strftime('%Y-%m-%d %H:%M') if LAST_ALERT_TIME else "Never"
+        next_t = NEXT_ALERT_TIME.strftime('%Y-%m-%d %H:%M') if NEXT_ALERT_TIME else "Unknown"
+        return (
+            f"<b>Bot Status</b>\n\n"
+            f"Uptime: {uptime}\n"
+            f"Last alert: {last}\n"
+            f"Next scheduled alert: {next_t}"
+        )
+
+    return None
+
+
+def telegram_listener():
+    """Listen for Telegram commands in a background thread."""
+    token = os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("CHAT_ID")
+
+    if not token or not chat_id:
+        LOGGER.error("BOT_TOKEN or CHAT_ID missing - command listener disabled")
+        return
+
+    offset = 0
+    LOGGER.info("Telegram command listener started")
+
+    while True:
+        try:
+            response = requests.get(
+                TELEGRAM_GET_UPDATES.format(token=token),
+                params={"offset": offset, "timeout": 30},
+                timeout=35,
+            )
+            data = response.json()
+
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+
+                message = update.get("message")
+                if not message:
+                    continue
+
+                # Only respond to the configured chat
+                if str(message["chat"]["id"]) != str(chat_id):
+                    continue
+
+                text = message.get("text", "")
+                if not text:
+                    continue
+
+                reply = handle_command(text)
+                if reply:
+                    send_telegram(reply)
+
+        except Exception as e:
+            LOGGER.warning("Telegram listener error: %s", e)
+            time.sleep(10)
 
 
 def main() -> None:
@@ -324,17 +443,26 @@ def main() -> None:
         run_once(dry_run=args.dry_run)
         return
 
+    # Start command listener in background
+    listener_thread = threading.Thread(target=telegram_listener, daemon=True)
+    listener_thread.start()
+
     LOGGER.info("Bot started; sending every %.2f hours", interval_hours)
 
+    # Send first alert immediately
+    try:
+        run_once(dry_run=False)
+    except Exception as e:
+        LOGGER.error("Initial alert failed: %s", e)
+
     while True:
+        time.sleep(interval_hours * 60 * 60)
         try:
             run_once(dry_run=False)
         except MarketDataError as exc:
             LOGGER.error("Alert skipped because market data was unsafe: %s", exc)
         except Exception:
             LOGGER.exception("Alert cycle failed")
-
-        time.sleep(interval_hours * 60 * 60)
 
 
 if __name__ == "__main__":
