@@ -230,14 +230,15 @@ def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
                         if vout:
                             to_addr = vout[0].get("scriptpubkey_address", "Unknown")
 
-                        # Best-effort Buy / Sell classification
                         from_ex = is_exchange_like(from_addr)
                         to_ex = is_exchange_like(to_addr)
 
+                        # Improved classification
                         if from_ex and not to_ex:
-                            buy_volume += amount          # leaving exchange → Buy pressure
+                            buy_volume += amount      # From exchange → Buy pressure
                         elif to_ex and not from_ex:
-                            sell_volume += amount         # going to exchange → Sell pressure
+                            sell_volume += amount     # To exchange → Sell pressure
+                        # else: both exchange or neither → ignore (neutral)
 
                         usd = amount * btc_price
                         php = usd * php_rate
