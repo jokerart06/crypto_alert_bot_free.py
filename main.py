@@ -161,65 +161,80 @@ def get_hot_coins(timeout: float = 12) -> tuple[list, list]:
 
 def get_whale_transactions(min_btc: float = 50, max_btc: float = 3000, hours: int = 8) -> list[dict]:
     """
-    Best-effort free whale data.
-    Uses a public source and filters 50–3000 BTC.
-    Returns empty list on failure.
+    Alternative free source attempt for large BTC transactions.
+    Falls back gracefully if data is unavailable.
     """
     whales = []
     try:
-        # Using Blockchair-style public recent large txs approximation
-        # Note: Free endpoints are limited; this is best-effort
-        url = "https://api.blockchair.com/bitcoin/transactions"
-        params = {
-            "q": f"output_total({int(min_btc * 1e8)}..{int(max_btc * 1e8)})",
-            "limit": 20,
-            "s": "time(desc)",
-        }
-        data = get_json(url, params=params, timeout=12)
-        context = data.get("context", {})
-        rows = data.get("data", [])
+        # Alternative: use mempool.space recent blocks + simple filtering (best-effort)
+        # We fetch recent blocks and look for large transactions
+        blocks_url = "https://mempool.space/api/v1/blocks"
+        blocks = get_json(blocks_url, timeout=10)
+
+        if not isinstance(blocks, list):
+            return []
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        seen = 0
 
-        for tx in rows:
+        for block in blocks[:8]:  # check last few blocks only
+            if seen >= 8:
+                break
             try:
-                # Blockchair returns time as string or unix
-                tx_time = tx.get("time")
-                if isinstance(tx_time, str):
-                    tx_dt = datetime.fromisoformat(tx_time.replace("Z", "+00:00"))
-                else:
-                    tx_dt = datetime.fromtimestamp(tx_time, tz=timezone.utc)
-
-                if tx_dt < cutoff:
+                block_time = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc)
+                if block_time < cutoff:
                     continue
 
-                amount_btc = float(tx.get("output_total", 0)) / 1e8
-                if not (min_btc <= amount_btc <= max_btc):
+                block_hash = block.get("id")
+                if not block_hash:
                     continue
 
-                # Simplified from/to (Blockchair structure varies)
-                inputs = tx.get("inputs", []) or []
-                outputs = tx.get("outputs", []) or []
+                # Get transactions of this block (limited)
+                tx_url = f"https://mempool.space/api/block/{block_hash}/txs"
+                txs = get_json(tx_url, timeout=10)
 
-                from_addr = "Unknown"
-                to_addr = "Unknown"
-                if inputs:
-                    from_addr = str(inputs[0].get("recipient", inputs[0].get("address", "Unknown")))[:12] + "..."
-                if outputs:
-                    to_addr = str(outputs[0].get("recipient", outputs[0].get("address", "Unknown")))[:12] + "..."
+                if not isinstance(txs, list):
+                    continue
 
-                whales.append({
-                    "amount": amount_btc,
-                    "from": from_addr,
-                    "to": to_addr,
-                    "time": tx_dt.strftime("%H:%M UTC"),
-                })
+                for tx in txs[:30]:  # limit per block
+                    try:
+                        # Calculate total output value
+                        total_out = sum(vout.get("value", 0) for vout in tx.get("vout", []))
+                        amount_btc = total_out / 1e8
+
+                        if not (min_btc <= amount_btc <= max_btc):
+                            continue
+
+                        # Simple from / to
+                        vin = tx.get("vin", [])
+                        vout = tx.get("vout", [])
+
+                        from_addr = "Unknown"
+                        to_addr = "Unknown"
+
+                        if vin and vin[0].get("prevout"):
+                            from_addr = str(vin[0]["prevout"].get("scriptpubkey_address", "Unknown"))[:14] + "..."
+                        if vout:
+                            to_addr = str(vout[0].get("scriptpubkey_address", "Unknown"))[:14] + "..."
+
+                        whales.append({
+                            "amount": amount_btc,
+                            "from": from_addr,
+                            "to": to_addr,
+                            "time": block_time.strftime("%H:%M UTC"),
+                        })
+                        seen += 1
+                        if seen >= 8:
+                            break
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
-        return whales[:8]  # max 8 entries
+        return whales
+
     except Exception as e:
-        LOGGER.warning("Whale data unavailable: %s", e)
+        LOGGER.warning("Whale data unavailable (alternative source): %s", e)
         return []
 
 
