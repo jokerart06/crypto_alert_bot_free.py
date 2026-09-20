@@ -154,15 +154,34 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
 def label_address(addr: str) -> str:
     if not addr or addr == "Unknown":
         return "Unknown"
+
+    # First check local known list
     for known, name in KNOWN_EXCHANGES.items():
         if known.lower() in addr.lower():
             return f"{addr} ({name})"
+
+    # Try free satoshidata.ai lookup
+    try:
+        url = f"https://satoshidata.ai/v1/wallets/{addr}/trust-safety"
+        r = requests.get(url, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            label = data.get("label", {})
+            if isinstance(label, dict):
+                value = label.get("value") or label.get("category")
+                if value:
+                    return f"{addr} ({value})"
+    except Exception:
+        pass  # silently ignore if the free API fails
+
+    # Fallback heuristics
     if addr.startswith(("1", "3")):
         return f"{addr} (Possible Exchange / Old Wallet)"
     if addr.startswith("bc1q") and len(addr) >= 42:
         return f"{addr} (Possible Exchange)"
     if addr.startswith("bc1p"):
         return f"{addr} (Taproot / Unknown)"
+
     return f"{addr} (Unknown)"
 
 
