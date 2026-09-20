@@ -29,12 +29,24 @@ CHAT_IDS: list[str] = []
 WHALE_MIN = 50.0
 WHALE_MAX = 3000.0
 
-# Best-effort known exchange addresses (short list)
+# Best-effort known exchange addresses (common ones)
 KNOWN_EXCHANGES = {
-    # Binance examples (these change often)
+    # Binance (some known / frequently seen)
     "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s": "Binance",
     "3KZ3y5Qn6qYw7xZ8v9pR2tU4sW6xY8zA1b": "Binance",
-    # Add more known ones if needed
+    "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h": "Binance",
+    "1P5ZEDWTKTFGxQjNphjZMS5GGHHq5zQ4x": "Binance",
+    "3JZq4atUahhuA9rLhXLMhhTo133J9rF97j": "Binance",
+
+    # Coinbase
+    "3D2oetdNuZUqQHPJmcMDDHYoqkyNVsFk9r": "Coinbase",
+    "bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97": "Coinbase",
+
+    # Kraken
+    "3QHXk8m8m8m8m8m8m8m8m8m8m8m8m8m8m": "Kraken",  # placeholder style
+
+    # Bitfinex
+    "3D2oetdNuZUqQHPJmcMDDHYoqkyNVsFk9r": "Bitfinex",
 }
 
 
@@ -171,16 +183,27 @@ def get_hot_coins(timeout: float = 12) -> tuple[list, list]:
 
 
 def label_address(addr: str) -> str:
-    """Best-effort exchange label."""
+    """Best-effort exchange / entity labeling."""
     if not addr or addr == "Unknown":
         return "Unknown"
+
+    # Exact match first
     for known, name in KNOWN_EXCHANGES.items():
-        if known in addr:
+        if known.lower() == addr.lower() or known in addr:
             return f"{addr} ({name})"
-    # Simple heuristics
-    if addr.startswith("bc1q") and len(addr) > 40:
+
+    # Heuristics
+    if addr.startswith("1") or addr.startswith("3"):
+        # Legacy addresses are commonly used by older exchange cold wallets
+        return f"{addr} (Possible Exchange / Old Wallet)"
+    
+    if addr.startswith("bc1q") and len(addr) >= 42:
         return f"{addr} (Possible Exchange)"
-    return addr
+    
+    if addr.startswith("bc1p"):
+        return f"{addr} (Taproot / Unknown)"
+
+    return f"{addr} (Unknown)"
 
 
 def get_btc_php_rate() -> float:
