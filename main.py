@@ -154,34 +154,15 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
 def label_address(addr: str) -> str:
     if not addr or addr == "Unknown":
         return "Unknown"
-
-    # First check local known list
     for known, name in KNOWN_EXCHANGES.items():
         if known.lower() in addr.lower():
             return f"{addr} ({name})"
-
-    # Try free satoshidata.ai lookup
-    try:
-        url = f"https://satoshidata.ai/v1/wallets/{addr}/trust-safety"
-        r = requests.get(url, timeout=6)
-        if r.status_code == 200:
-            data = r.json()
-            label = data.get("label", {})
-            if isinstance(label, dict):
-                value = label.get("value") or label.get("category")
-                if value:
-                    return f"{addr} ({value})"
-    except Exception:
-        pass  # silently ignore if the free API fails
-
-    # Fallback heuristics
     if addr.startswith(("1", "3")):
         return f"{addr} (Possible Exchange / Old Wallet)"
     if addr.startswith("bc1q") and len(addr) >= 42:
         return f"{addr} (Possible Exchange)"
     if addr.startswith("bc1p"):
         return f"{addr} (Taproot / Unknown)"
-
     return f"{addr} (Unknown)"
 
 
@@ -201,14 +182,13 @@ def get_btc_php_rate() -> float:
 
 
 def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
-    """Returns (whales_list, buy_percent, sell_percent) with backup source."""
+    """Returns (whales_list, buy_percent, sell_percent)"""
     global WHALE_MIN, WHALE_MAX, WHALE_HOURS, WHALE_LIMIT
+    whales = []
+    buy_volume = 0.0
+    sell_volume = 0.0
 
-    def try_mempool() -> tuple[list[dict], float, float]:
-        whales = []
-        buy_volume = 0.0
-        sell_volume = 0.0
-
+    try:
         blocks = get_json("https://mempool.space/api/v1/blocks", timeout=10)
         if not isinstance(blocks, list):
             return [], 0.0, 0.0
@@ -217,7 +197,7 @@ def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
         php_rate = get_btc_php_rate()
         seen = 0
 
-        for block in blocks[:12]:
+        for block in blocks[:15]:
             if seen >= WHALE_LIMIT:
                 break
             try:
@@ -233,7 +213,7 @@ def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
                 if not isinstance(txs, list):
                     continue
 
-                for tx in txs[:25]:
+                for tx in txs[:30]:
                     try:
                         total_out = sum(v.get("value", 0) for v in tx.get("vout", []))
                         amount = total_out / 1e8
@@ -250,13 +230,14 @@ def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
                         if vout:
                             to_addr = vout[0].get("scriptpubkey_address", "Unknown")
 
+                        # Best-effort Buy / Sell classification
                         from_ex = is_exchange_like(from_addr)
                         to_ex = is_exchange_like(to_addr)
 
                         if from_ex and not to_ex:
-                            buy_volume += amount
+                            buy_volume += amount          # leaving exchange → Buy pressure
                         elif to_ex and not from_ex:
-                            sell_volume += amount
+                            sell_volume += amount         # going to exchange → Sell pressure
 
                         usd = amount * btc_price
                         php = usd * php_rate
@@ -279,65 +260,16 @@ def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
 
         total = buy_volume + sell_volume
         if total > 0:
-            return whales, (buy_volume / total) * 100, (sell_volume / total) * 100
-        return whales, 0.0, 0.0
+            buy_pct = (buy_volume / total) * 100
+            sell_pct = (sell_volume / total) * 100
+        else:
+            buy_pct = sell_pct = 0.0
 
-    def try_backup() -> tuple[list[dict], float, float]:
-        """Simple backup using blockchain.info style recent large txs (best effort)."""
-        try:
-            # Fallback: very limited free source
-            url = "https://blockchain.info/unconfirmed-transactions?format=json"
-            data = get_json(url, timeout=10)
-            txs = data.get("txs", []) if isinstance(data, dict) else []
+        return whales, buy_pct, sell_pct
 
-            whales = []
-            php_rate = get_btc_php_rate()
-            seen = 0
-
-            for tx in txs:
-                if seen >= WHALE_LIMIT:
-                    break
-                try:
-                    total_out = sum(o.get("value", 0) for o in tx.get("out", []))
-                    amount = total_out / 1e8
-                    if not (WHALE_MIN <= amount <= WHALE_MAX):
-                        continue
-
-                    # Very limited info from this endpoint
-                    from_addr = "Unknown (mempool)"
-                    to_addr = "Unknown (mempool)"
-                    if tx.get("inputs"):
-                        prev = tx["inputs"][0].get("prev_out", {})
-                        from_addr = prev.get("addr", "Unknown")
-                    if tx.get("out"):
-                        to_addr = tx["out"][0].get("addr", "Unknown")
-
-                    usd = amount * btc_price
-                    php = usd * php_rate
-
-                    whales.append({
-                        "amount": amount,
-                        "usd": usd,
-                        "php": php,
-                        "from": label_address(from_addr),
-                        "to": label_address(to_addr),
-                        "time": "Recent (unconfirmed)",
-                    })
-                    seen += 1
-                except Exception:
-                    continue
-
-            return whales, 0.0, 0.0  # buy/sell % not reliable on this source
-        except Exception as e:
-            LOGGER.warning("Backup whale source also failed: %s", e)
-            return [], 0.0, 0.0
-
-    # Try main source first
-    try:
-        return try_mempool()
     except Exception as e:
-        LOGGER.warning("mempool.space failed: %s — trying backup", e)
-        return try_backup()
+        LOGGER.warning("Whale data unavailable: %s", e)
+        return [], 0.0, 0.0
 
 
 def score_market(data: MarketData) -> tuple[int, str]:
@@ -437,10 +369,10 @@ def build_message(data: MarketData) -> str:
     lines.append(f"<b>🐋 WHALE ALERT ({WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | Last {WHALE_HOURS}h)</b>")
     whales, buy_pct, sell_pct = get_whale_transactions(data.price)
 
- if buy_pct or sell_pct:
-    dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
-    lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
-    lines.append("")
+    if buy_pct or sell_pct:
+        dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
+        lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
+        lines.append("")
 
     if whales:
         for w in whales:
