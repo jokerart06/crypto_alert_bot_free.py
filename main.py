@@ -154,15 +154,34 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
 def label_address(addr: str) -> str:
     if not addr or addr == "Unknown":
         return "Unknown"
+
+    # First check local known list
     for known, name in KNOWN_EXCHANGES.items():
         if known.lower() in addr.lower():
             return f"{addr} ({name})"
+
+    # Try free satoshidata.ai lookup
+    try:
+        url = f"https://satoshidata.ai/v1/wallets/{addr}/trust-safety"
+        r = requests.get(url, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            label = data.get("label", {})
+            if isinstance(label, dict):
+                value = label.get("value") or label.get("category")
+                if value:
+                    return f"{addr} ({value})"
+    except Exception:
+        pass  # silently ignore if the free API fails
+
+    # Fallback heuristics
     if addr.startswith(("1", "3")):
         return f"{addr} (Possible Exchange / Old Wallet)"
     if addr.startswith("bc1q") and len(addr) >= 42:
         return f"{addr} (Possible Exchange)"
     if addr.startswith("bc1p"):
         return f"{addr} (Taproot / Unknown)"
+
     return f"{addr} (Unknown)"
 
 
@@ -418,10 +437,12 @@ def build_message(data: MarketData) -> str:
     lines.append(f"<b>🐋 WHALE ALERT ({WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | Last {WHALE_HOURS}h)</b>")
     whales, buy_pct, sell_pct = get_whale_transactions(data.price)
 
-    if buy_pct or sell_pct:
-        dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
-        lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
-        lines.append("")
+   if buy_pct == 0 and sell_pct == 0:
+    lines.append("Buy vs Sell: <b>0.0% Buy</b> / <b>0.0% Sell</b> → Insufficient labeled data")
+else:
+    dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
+    lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
+lines.append("")
 
     if whales:
         for w in whales:
