@@ -437,12 +437,10 @@ def build_message(data: MarketData) -> str:
     lines.append(f"<b>🐋 WHALE ALERT ({WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | Last {WHALE_HOURS}h)</b>")
     whales, buy_pct, sell_pct = get_whale_transactions(data.price)
 
-   if buy_pct == 0 and sell_pct == 0:
-    lines.append("Buy vs Sell: <b>0.0% Buy</b> / <b>0.0% Sell</b> → Insufficient labeled data")
-else:
+ if buy_pct or sell_pct:
     dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
     lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
-lines.append("")
+    lines.append("")
 
     if whales:
         for w in whales:
