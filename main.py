@@ -25,7 +25,7 @@ NEXT_ALERT_TIME: datetime | None = None
 WATCHLIST: list[str] = []
 CHAT_IDS: list[str] = []
 
-# Whale settings (changeable via commands)
+# Whale settings
 WHALE_MIN = 50.0
 WHALE_MAX = 3000.0
 WHALE_HOURS = 8
@@ -151,33 +151,12 @@ def get_market_data(symbol: str, interval: str, timeout: float) -> MarketData:
         raise MarketDataError(str(e)) from e
 
 
-def get_hot_coins(timeout: float = 12) -> tuple[list, list]:
-    try:
-        data = get_json(TICKER_URL, timeout=timeout)
-        usdt = [
-            t for t in data
-            if isinstance(t, dict)
-            and str(t.get("symbol", "")).endswith("USDT")
-            and not any(x in t["symbol"] for x in ("UPUSDT", "DOWNUSDT", "BULL", "BEAR"))
-        ]
-        gainers = sorted(usdt, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)[:8]
-        top_g = [(t["symbol"], float(t["priceChangePercent"])) for t in gainers]
-        by_vol = sorted(usdt, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)[:6]
-        top_v = [(t["symbol"], float(t["quoteVolume"])) for t in by_vol]
-        return top_g, top_v
-    except Exception as e:
-        LOGGER.warning("Hot coins error: %s", e)
-        return [], []
-
-
 def label_address(addr: str) -> str:
     if not addr or addr == "Unknown":
         return "Unknown"
-
     for known, name in KNOWN_EXCHANGES.items():
         if known.lower() in addr.lower():
             return f"{addr} ({name})"
-
     if addr.startswith(("1", "3")):
         return f"{addr} (Possible Exchange / Old Wallet)"
     if addr.startswith("bc1q") and len(addr) >= 42:
@@ -185,6 +164,13 @@ def label_address(addr: str) -> str:
     if addr.startswith("bc1p"):
         return f"{addr} (Taproot / Unknown)"
     return f"{addr} (Unknown)"
+
+
+def is_exchange_like(addr: str) -> bool:
+    if not addr or addr == "Unknown":
+        return False
+    label = label_address(addr).lower()
+    return "exchange" in label or "binance" in label or "coinbase" in label
 
 
 def get_btc_php_rate() -> float:
@@ -195,13 +181,17 @@ def get_btc_php_rate() -> float:
         return 56.5
 
 
-def get_whale_transactions(btc_price: float) -> list[dict]:
+def get_whale_transactions(btc_price: float) -> tuple[list[dict], float, float]:
+    """Returns (whales_list, buy_percent, sell_percent)"""
     global WHALE_MIN, WHALE_MAX, WHALE_HOURS, WHALE_LIMIT
     whales = []
+    buy_volume = 0.0
+    sell_volume = 0.0
+
     try:
         blocks = get_json("https://mempool.space/api/v1/blocks", timeout=10)
         if not isinstance(blocks, list):
-            return []
+            return [], 0.0, 0.0
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=WHALE_HOURS)
         php_rate = get_btc_php_rate()
@@ -227,7 +217,6 @@ def get_whale_transactions(btc_price: float) -> list[dict]:
                     try:
                         total_out = sum(v.get("value", 0) for v in tx.get("vout", []))
                         amount = total_out / 1e8
-
                         if not (WHALE_MIN <= amount <= WHALE_MAX):
                             continue
 
@@ -240,6 +229,15 @@ def get_whale_transactions(btc_price: float) -> list[dict]:
                             from_addr = vin[0]["prevout"].get("scriptpubkey_address", "Unknown")
                         if vout:
                             to_addr = vout[0].get("scriptpubkey_address", "Unknown")
+
+                        # Best-effort Buy / Sell classification
+                        from_ex = is_exchange_like(from_addr)
+                        to_ex = is_exchange_like(to_addr)
+
+                        if from_ex and not to_ex:
+                            buy_volume += amount          # leaving exchange → Buy pressure
+                        elif to_ex and not from_ex:
+                            sell_volume += amount         # going to exchange → Sell pressure
 
                         usd = amount * btc_price
                         php = usd * php_rate
@@ -259,10 +257,19 @@ def get_whale_transactions(btc_price: float) -> list[dict]:
                         continue
             except Exception:
                 continue
-        return whales
+
+        total = buy_volume + sell_volume
+        if total > 0:
+            buy_pct = (buy_volume / total) * 100
+            sell_pct = (sell_volume / total) * 100
+        else:
+            buy_pct = sell_pct = 0.0
+
+        return whales, buy_pct, sell_pct
+
     except Exception as e:
         LOGGER.warning("Whale data unavailable: %s", e)
-        return []
+        return [], 0.0, 0.0
 
 
 def score_market(data: MarketData) -> tuple[int, str]:
@@ -336,31 +343,37 @@ def build_message(data: MarketData) -> str:
     score, signal = score_market(data)
     uptime = get_uptime_str()
 
+    # Funding status
+    if data.funding_percent < 0:
+        fund_status = "GOOD (short bias)"
+    elif data.funding_percent > 0.05:
+        fund_status = "HIGH (long bias)"
+    else:
+        fund_status = "NEUTRAL"
+
     lines = [
         f"<b>PRO MARKET CHECKLIST — {ts.strftime('%b %d %I:%M %p')}</b>",
         "",
         f"<b>{data.symbol}</b>: ${data.price:,.2f} ({data.change_24h:+.2f}% 24h)",
-        f"Trend: {'BULLISH' if data.ema20 > data.ema50 else 'BEARISH'} | RSI {data.rsi14:.1f} | Vol {data.volume_ratio:.2f}x",
-        f"Score: <b>{score}/4</b> → <b>{signal}</b>",
+        f"Trend: {'BULLISH' if data.ema20 > data.ema50 else 'BEARISH'} | RSI {data.rsi14:.1f}",
+        f"Funding Rate: <b>{data.funding_percent:.4f}%</b> ({fund_status})",
+        f"Volume: {data.volume_ratio:.2f}x",
+        "",
+        f"<b>Score: {score}/4</b> → <b>{signal}</b>",
         "",
     ]
     lines.extend(analyze_trend(data))
     lines.append("")
 
-    gainers, vols = get_hot_coins()
-    lines.append("<b>🔥 HOT COINS</b>")
-    if gainers:
-        lines.append("Top Gainers:")
-        for i, (s, c) in enumerate(gainers[:6], 1):
-            lines.append(f"{i}. {s} {c:+.1f}%")
-    if vols:
-        lines.append("Top Volume:")
-        for i, (s, v) in enumerate(vols[:4], 1):
-            lines.append(f"{i}. {s} ${v/1e6:,.0f}M")
+    # Whale section
+    lines.append(f"<b>🐋 WHALE ALERT ({WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | Last {WHALE_HOURS}h)</b>")
+    whales, buy_pct, sell_pct = get_whale_transactions(data.price)
 
-    lines.append("")
-    lines.append(f"<b>🐋 WHALE ALERT ({WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | Last {WHALE_HOURS}h | Limit {WHALE_LIMIT})</b>")
-    whales = get_whale_transactions(data.price)
+    if buy_pct or sell_pct:
+        dominant = "BUY" if buy_pct > sell_pct else "SELL" if sell_pct > buy_pct else "BALANCED"
+        lines.append(f"Buy vs Sell: <b>{buy_pct:.1f}% Buy</b> / <b>{sell_pct:.1f}% Sell</b> → {dominant}")
+        lines.append("")
+
     if whales:
         for w in whales:
             lines.append(
@@ -379,7 +392,7 @@ def build_message(data: MarketData) -> str:
     lines += [
         "",
         f"<i>Uptime: {uptime}</i>",
-        f"<i>Whale: {WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | {WHALE_HOURS}h | show {WHALE_LIMIT}</i>",
+        f"<i>Whale settings: {WHALE_MIN:.0f}-{WHALE_MAX:.0f} BTC | {WHALE_HOURS}h | limit {WHALE_LIMIT}</i>",
         "<i>Educational only — not financial advice.</i>",
     ]
     return "\n".join(lines)
@@ -389,11 +402,9 @@ def send_telegram(message: str, chat_id: str | None = None) -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise ValueError("BOT_TOKEN missing")
-
     targets = [chat_id] if chat_id else CHAT_IDS
     if len(message) > 4090:
         message = message[:4000] + "\n...(truncated)"
-
     for cid in targets:
         try:
             r = requests.post(
@@ -415,11 +426,9 @@ def run_once(dry_run: bool = False) -> None:
     interval = os.getenv("CANDLE_INTERVAL", "1h")
     data = get_market_data(symbol, interval, env_float("REQUEST_TIMEOUT_SECONDS", 15))
     msg = build_message(data)
-
     if dry_run:
         print(msg)
         return
-
     send_telegram(msg)
     LAST_ALERT_TIME = datetime.now().astimezone()
     NEXT_ALERT_TIME = LAST_ALERT_TIME + timedelta(hours=env_float("RUN_INTERVAL_HOURS", 6))
@@ -433,20 +442,12 @@ def handle_command(text: str, from_id: str) -> str | None:
     if lower in ("/start", "start", "/help"):
         return (
             "<b>Crypto Alert Bot — Commands</b>\n\n"
-            "/uptime\n"
-            "/refresh or /now\n"
-            "/status\n"
+            "/uptime\n/refresh or /now\n/status\n"
             "/whalesettings\n"
-            "/whalemin 50\n"
-            "/whalemax 3000\n"
-            "/whalehours 8\n"
-            "/whalelimit 10\n"
-            "/watchlist\n"
-            "/add SYMBOL\n"
-            "/remove SYMBOL\n"
-            "/subscribers (admin)\n"
-            "/adduser ID (admin)\n"
-            "/removeuser ID (admin)"
+            "/whalemin 50\n/whalemax 3000\n"
+            "/whalehours 8\n/whalelimit 10\n"
+            "/watchlist\n/add SYMBOL\n/remove SYMBOL\n"
+            "/subscribers (admin)\n/adduser ID (admin)\n/removeuser ID (admin)"
         )
 
     if lower == "/uptime":
@@ -462,28 +463,26 @@ def handle_command(text: str, from_id: str) -> str | None:
     if lower == "/status":
         last = LAST_ALERT_TIME.strftime("%Y-%m-%d %H:%M") if LAST_ALERT_TIME else "—"
         return (
-            f"Uptime: {get_uptime_str()}\n"
-            f"Last alert: {last}\n"
-            f"Whale: {WHALE_MIN:.0f}–{WHALE_MAX:.0f} BTC | {WHALE_HOURS}h | limit {WHALE_LIMIT}\n"
+            f"Uptime: {get_uptime_str()}\nLast: {last}\n"
+            f"Whale: {WHALE_MIN:.0f}-{WHALE_MAX:.0f} BTC | {WHALE_HOURS}h | limit {WHALE_LIMIT}\n"
             f"Subscribers: {len(CHAT_IDS)}"
         )
 
     if lower == "/whalesettings":
         return (
             f"<b>Whale Settings</b>\n"
-            f"Min: {WHALE_MIN:.0f} BTC\n"
-            f"Max: {WHALE_MAX:.0f} BTC\n"
+            f"Min: {WHALE_MIN:.0f} BTC\nMax: {WHALE_MAX:.0f} BTC\n"
             f"Time window: Last {WHALE_HOURS} hours\n"
-            f"Show limit: {WHALE_LIMIT} transactions"
+            f"Show limit: {WHALE_LIMIT}"
         )
 
     if lower.startswith("/whalemin "):
         try:
             val = float(text.split()[1])
             if val < 1:
-                return "Minimum must be at least 1 BTC"
+                return "Min must be ≥ 1"
             WHALE_MIN = val
-            return f"Whale minimum set to <b>{val:.0f} BTC</b>"
+            return f"Min set to <b>{val:.0f} BTC</b>"
         except Exception:
             return "Usage: /whalemin 50"
 
@@ -491,9 +490,9 @@ def handle_command(text: str, from_id: str) -> str | None:
         try:
             val = float(text.split()[1])
             if val <= WHALE_MIN:
-                return "Maximum must be higher than minimum"
+                return "Max must be higher than min"
             WHALE_MAX = val
-            return f"Whale maximum set to <b>{val:.0f} BTC</b>"
+            return f"Max set to <b>{val:.0f} BTC</b>"
         except Exception:
             return "Usage: /whalemax 3000"
 
@@ -501,9 +500,9 @@ def handle_command(text: str, from_id: str) -> str | None:
         try:
             val = int(text.split()[1])
             if not 1 <= val <= 48:
-                return "Please choose between 1 and 48 hours"
+                return "Choose 1–48 hours"
             WHALE_HOURS = val
-            return f"Time window set to <b>last {val} hours</b>"
+            return f"Time window set to <b>{val} hours</b>"
         except Exception:
             return "Usage: /whalehours 8"
 
@@ -511,9 +510,9 @@ def handle_command(text: str, from_id: str) -> str | None:
         try:
             val = int(text.split()[1])
             if not 1 <= val <= 20:
-                return "Please choose between 1 and 20"
+                return "Choose 1–20"
             WHALE_LIMIT = val
-            return f"Show limit set to <b>{val} transactions</b>"
+            return f"Limit set to <b>{val}</b>"
         except Exception:
             return "Usage: /whalelimit 10"
 
@@ -565,11 +564,8 @@ def telegram_listener():
     LOGGER.info("Listener started")
     while True:
         try:
-            r = requests.get(
-                TELEGRAM_GET_UPDATES.format(token=token),
-                params={"offset": offset, "timeout": 30},
-                timeout=35,
-            )
+            r = requests.get(TELEGRAM_GET_UPDATES.format(token=token),
+                             params={"offset": offset, "timeout": 30}, timeout=35)
             data = r.json()
             if not data.get("ok"):
                 time.sleep(5)
@@ -618,10 +614,7 @@ def main():
 
     threading.Thread(target=telegram_listener, daemon=True).start()
     hours = env_float("RUN_INTERVAL_HOURS", 6)
-    LOGGER.info(
-        "Bot started | every %.1fh | subs: %d | whale %s-%s BTC | %sh | limit %s",
-        hours, len(CHAT_IDS), WHALE_MIN, WHALE_MAX, WHALE_HOURS, WHALE_LIMIT
-    )
+    LOGGER.info("Bot started | every %.1fh | subs: %d", hours, len(CHAT_IDS))
 
     try:
         run_once()
